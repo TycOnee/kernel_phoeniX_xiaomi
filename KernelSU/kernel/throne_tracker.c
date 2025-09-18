@@ -5,8 +5,6 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/version.h>
-#include <linux/stat.h>
-#include <linux/namei.h>
 
 #include "allowlist.h"
 #include "klog.h" // IWYU pragma: keep
@@ -15,18 +13,123 @@
 #include "throne_tracker.h"
 #include "kernel_compat.h"
 #include "dynamic_manager.h"
+#include "throne_comm.h"
 
 uid_t ksu_manager_uid = KSU_INVALID_UID;
 
 #define SYSTEM_PACKAGES_LIST_PATH "/data/system/packages.list.tmp"
-#define USER_DATA_PATH "/data/user_de/0"
-#define USER_DATA_PATH_LEN 256
+#define KSU_UID_LIST_PATH "/data/misc/user_uid/uid_list"
 
 struct uid_data {
 	struct list_head list;
 	u32 uid;
 	char package[KSU_MAX_PACKAGE_NAME];
 };
+
+// Try read whitelist first, fallback if failed
+static int read_uid_whitelist(struct list_head *uid_list)
+{
+	struct file *fp;
+	char *file_content = NULL;
+	char *line, *next_line;
+	loff_t file_size;
+	loff_t pos = 0;
+	int count = 0;
+	ssize_t bytes_read;
+	
+	fp = ksu_filp_open_compat(KSU_UID_LIST_PATH, O_RDONLY, 0);
+	if (IS_ERR(fp)) {
+		pr_info("whitelist not found, fallback needed\n");
+		return -ENOENT;
+	}
+
+	file_size = fp->f_inode->i_size;
+	if (file_size <= 0) {
+		pr_info("whitelist file is empty\n");
+		filp_close(fp, NULL);
+		return -ENODATA;
+	}
+
+	file_content = kzalloc(file_size + 1, GFP_ATOMIC);
+	if (!file_content) {
+		pr_err("failed to allocate memory for whitelist file (%lld bytes)\n", file_size);
+		filp_close(fp, NULL);
+		return -ENOMEM;
+	}
+
+	bytes_read = ksu_kernel_read_compat(fp, file_content, file_size, &pos);
+	if (bytes_read != file_size) {
+		pr_err("failed to read whitelist file: read %zd bytes, expected %lld bytes\n", 
+		       bytes_read, file_size);
+		kfree(file_content);
+		filp_close(fp, NULL);
+		return -EIO;
+	}
+
+	file_content[file_size] = '\0';
+	filp_close(fp, NULL);
+
+	pr_info("successfully read whitelist file (%lld bytes), parsing lines...\n", file_size);
+
+	line = file_content;
+	while (line && *line) {
+		next_line = strchr(line, '\n');
+		if (next_line) {
+			*next_line = '\0';
+			next_line++;
+		}
+
+		char *trimmed_line = line;
+		while (*trimmed_line == ' ' || *trimmed_line == '\t' || *trimmed_line == '\r') {
+			trimmed_line++;
+		}
+
+		if (strlen(trimmed_line) > 0) {
+			char *line_copy = trimmed_line;
+			char *uid_str = strsep(&line_copy, " \t");
+			char *package_name = line_copy;
+			
+			if (package_name) {
+				while (*package_name == ' ' || *package_name == '\t') {
+					package_name++;
+				}
+			}
+			
+			if (uid_str && package_name && strlen(package_name) > 0) {
+				u32 uid;
+				if (!kstrtou32(uid_str, 10, &uid)) {
+					struct uid_data *data = kzalloc(sizeof(struct uid_data), GFP_ATOMIC);
+					if (data) {
+						data->uid = uid;
+						size_t pkg_len = strlen(package_name);
+						size_t copy_len = min(pkg_len, (size_t)(KSU_MAX_PACKAGE_NAME - 1));
+						strncpy(data->package, package_name, copy_len);
+						data->package[copy_len] = '\0';
+						
+						list_add_tail(&data->list, uid_list);
+						count++;
+						
+						if (count % 100 == 0) {
+							pr_info("parsed %d packages so far...\n", count);
+						}
+					} else {
+						pr_err("failed to allocate memory for uid_data\n");
+					}
+				} else {
+					pr_warn("invalid uid format in line: %s\n", trimmed_line);
+				}
+			} else {
+				pr_warn("invalid line format: %s\n", trimmed_line);
+			}
+		}
+
+		line = next_line;
+	}
+	
+	kfree(file_content);
+	pr_info("successfully loaded %d uids from whitelist\n", count);
+	return count > 0 ? 0 : -ENODATA;
+}
 
 static int get_pkg_from_apk_path(char *pkg, const char *path)
 {
@@ -67,8 +170,7 @@ static int get_pkg_from_apk_path(char *pkg, const char *path)
 	return 0;
 }
 
-static void crown_manager(const char *apk, struct list_head *uid_data,
-			  int signature_index)
+static void crown_manager(const char *apk, struct list_head *uid_data, int signature_index)
 {
 	char pkg[KSU_MAX_PACKAGE_NAME];
 	if (get_pkg_from_apk_path(pkg, apk) < 0) {
@@ -89,15 +191,14 @@ static void crown_manager(const char *apk, struct list_head *uid_data,
 	struct list_head *list = (struct list_head *)uid_data;
 	struct uid_data *np;
 
-	list_for_each_entry(np, list, list) {
+	list_for_each_entry (np, list, list) {
 		if (strncmp(np->package, pkg, KSU_MAX_PACKAGE_NAME) == 0) {
-			pr_info("Crowning manager: %s(uid=%d, signature_index=%d)\n",
-				pkg, np->uid, signature_index);
-
+			pr_info("Crowning manager: %s(uid=%d, signature_index=%d)\n", pkg, np->uid, signature_index);
+			
 			// Dynamic Sign index (1) or multi-manager signatures (2+)
 			if (signature_index == DYNAMIC_SIGN_INDEX || signature_index >= 2) {
 				ksu_add_manager(np->uid, signature_index);
-
+				
 				if (!ksu_is_manager_uid_valid()) {
 					ksu_set_manager_uid(np->uid);
 				}
@@ -123,7 +224,7 @@ struct apk_path_hash {
 	struct list_head list;
 };
 
-static struct list_head apk_path_hash_list;
+static struct list_head apk_path_hash_list = LIST_HEAD_INIT(apk_path_hash_list);
 
 struct my_dir_context {
 	struct dir_context ctx;
@@ -144,138 +245,6 @@ struct my_dir_context {
 #define FILLDIR_ACTOR_CONTINUE 0
 #define FILLDIR_ACTOR_STOP -EINVAL
 #endif
-
-struct uid_scan_stats {
-	size_t total_found;
-	size_t errors_encountered;
-};
-
-struct user_data_context {
-	struct dir_context ctx;
-	struct list_head *uid_list;
-	struct uid_scan_stats *stats;
-};
-
-FILLDIR_RETURN_TYPE user_data_actor(struct dir_context *ctx, const char *name,
-				     int namelen, loff_t off, u64 ino,
-				     unsigned int d_type)
-{
-	struct user_data_context *my_ctx = 
-		container_of(ctx, struct user_data_context, ctx);
-	
-	if (!my_ctx || !my_ctx->uid_list) {
-		return FILLDIR_ACTOR_STOP;
-	}
-
-	if (!strncmp(name, "..", namelen) || !strncmp(name, ".", namelen))
-		return FILLDIR_ACTOR_CONTINUE;
-
-	if (d_type != DT_DIR)
-		return FILLDIR_ACTOR_CONTINUE;
-
-	if (namelen >= KSU_MAX_PACKAGE_NAME) {
-		pr_warn("Package name too long: %.*s\n", namelen, name);
-		if (my_ctx->stats)
-			my_ctx->stats->errors_encountered++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	char package_path[USER_DATA_PATH_LEN];
-	if (snprintf(package_path, sizeof(package_path), "%s/%.*s", 
-		     USER_DATA_PATH, namelen, name) >= sizeof(package_path)) {
-		pr_err("Path too long for package: %.*s\n", namelen, name);
-		if (my_ctx->stats)
-			my_ctx->stats->errors_encountered++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	struct path path;
-	int err = kern_path(package_path, LOOKUP_FOLLOW, &path);
-	if (err) {
-		pr_debug("Package path lookup failed: %s (err: %d)\n", package_path, err);
-		if (my_ctx->stats)
-			my_ctx->stats->errors_encountered++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	struct kstat stat;
-	err = vfs_getattr(&path, &stat, STATX_UID, AT_STATX_SYNC_AS_STAT);
-	path_put(&path);
-	
-	if (err) {
-		pr_debug("Failed to get attributes for: %s (err: %d)\n", package_path, err);
-		if (my_ctx->stats)
-			my_ctx->stats->errors_encountered++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	uid_t uid = from_kuid(&init_user_ns, stat.uid);
-	if (uid == (uid_t)-1) {
-		pr_warn("Invalid UID for package: %.*s\n", namelen, name);
-		if (my_ctx->stats)
-			my_ctx->stats->errors_encountered++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	struct uid_data *data = kzalloc(sizeof(struct uid_data), GFP_ATOMIC);
-	if (!data) {
-		pr_err("Failed to allocate memory for package: %.*s\n", namelen, name);
-		if (my_ctx->stats)
-			my_ctx->stats->errors_encountered++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	data->uid = uid;
-	size_t copy_len = min(namelen, KSU_MAX_PACKAGE_NAME - 1);
-	strncpy(data->package, name, copy_len);
-	data->package[copy_len] = '\0';
-	
-	list_add_tail(&data->list, my_ctx->uid_list);
-	
-	if (my_ctx->stats)
-		my_ctx->stats->total_found++;
-	
-	pr_info("UserDE UID: Found package: %s, uid: %u\n", data->package, data->uid);
-	
-	return FILLDIR_ACTOR_CONTINUE;
-}
-
-int scan_user_data_for_uids(struct list_head *uid_list)
-{
-	struct file *dir_file;
-	struct uid_scan_stats stats = {0};
-	int ret = 0;
-	
-	if (!uid_list) {
-		return -EINVAL;
-	}
-
-	dir_file = ksu_filp_open_compat(USER_DATA_PATH, O_RDONLY, 0);
-	if (IS_ERR(dir_file)) {
-		pr_err("UserDE UID: Failed to open %s: %ld\n", USER_DATA_PATH, PTR_ERR(dir_file));
-		return PTR_ERR(dir_file);
-	}
-
-	struct user_data_context ctx = {
-		.ctx.actor = user_data_actor,
-		.uid_list = uid_list,
-		.stats = &stats
-	};
-
-	ret = iterate_dir(dir_file, &ctx.ctx);
-	filp_close(dir_file, NULL);
-
-	if (stats.errors_encountered > 0) {
-		pr_warn("Encountered %zu errors while scanning user data directory\n", 
-			stats.errors_encountered);
-	}
-
-	pr_info("UserDE UID: Scanned user data directory, found %zu packages with %zu errors\n", 
-		stats.total_found, stats.errors_encountered);
-
-	return ret;
-}
-
 FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 			     int namelen, loff_t off, u64 ino,
 			     unsigned int d_type)
@@ -297,11 +266,11 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 		return FILLDIR_ACTOR_CONTINUE; // Skip "." and ".."
 
 	if (d_type == DT_DIR && namelen >= 8 && !strncmp(name, "vmdl", 4) &&
-	    !strncmp(name + namelen - 4, ".tmp", 4)) {
-		pr_info("Skipping directory: %.*s\n", namelen, name);
-		return FILLDIR_ACTOR_CONTINUE; // Skip staging package
-	}
-
+ 	    !strncmp(name + namelen - 4, ".tmp", 4)) {
+ 		pr_info("Skipping directory: %.*s\n", namelen, name);
+ 		return FILLDIR_ACTOR_CONTINUE; // Skip staging package
+ 	}
+	
 	if (snprintf(dirpath, DATA_PATH_LEN, "%s/%.*s", my_ctx->parent_dir,
 		     namelen, name) >= DATA_PATH_LEN) {
 		pr_err("Path too long: %s/%.*s\n", my_ctx->parent_dir, namelen,
@@ -311,8 +280,7 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 
 	if (d_type == DT_DIR && my_ctx->depth > 0 &&
 	    (my_ctx->stop && !*my_ctx->stop)) {
-		struct data_path *data =
-			kmalloc(sizeof(struct data_path), GFP_ATOMIC);
+		struct data_path *data = kmalloc(sizeof(struct data_path), GFP_ATOMIC);
 
 		if (!data) {
 			pr_err("Failed to allocate memory for %s\n", dirpath);
@@ -323,15 +291,12 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 		data->depth = my_ctx->depth - 1;
 		list_add_tail(&data->list, my_ctx->data_path_list);
 	} else {
-		if ((namelen == 8) &&
-		    (strncmp(name, "base.apk", namelen) == 0)) {
+		if ((namelen == 8) && (strncmp(name, "base.apk", namelen) == 0)) {
 			struct apk_path_hash *pos, *n;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
-			unsigned int hash =
-				full_name_hash(dirpath, strlen(dirpath));
+			unsigned int hash = full_name_hash(dirpath, strlen(dirpath));
 #else
-			unsigned int hash =
-				full_name_hash(NULL, dirpath, strlen(dirpath));
+			unsigned int hash = full_name_hash(NULL, dirpath, strlen(dirpath));
 #endif
 			list_for_each_entry(pos, &apk_path_hash_list, list) {
 				if (hash == pos->hash) {
@@ -346,42 +311,32 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 
 			pr_info("Found new base.apk at path: %s, is_multi_manager: %d, signature_index: %d\n",
 				dirpath, is_multi_manager, signature_index);
+				
 			// Check for dynamic sign or multi-manager signatures
-			if (is_multi_manager &&
-			    (signature_index == DYNAMIC_SIGN_INDEX || signature_index >= 2)) {
-				crown_manager(dirpath, my_ctx->private_data,
-					      signature_index);
-
-				struct apk_path_hash *apk_data =
-					kmalloc(sizeof(struct apk_path_hash),
-						GFP_ATOMIC);
-
+			if (is_multi_manager && (signature_index == DYNAMIC_SIGN_INDEX || signature_index >= 2)) {
+				crown_manager(dirpath, my_ctx->private_data, signature_index);
+				
+				struct apk_path_hash *apk_data = kmalloc(sizeof(struct apk_path_hash), GFP_ATOMIC);
 				if (apk_data) {
 					apk_data->hash = hash;
 					apk_data->exists = true;
-					list_add_tail(&apk_data->list,
-						      &apk_path_hash_list);
+					list_add_tail(&apk_data->list, &apk_path_hash_list);
 				}
-
 			} else if (is_manager_apk(dirpath)) {
 				crown_manager(dirpath, my_ctx->private_data, 0);
 				*my_ctx->stop = 1;
 
 				// Manager found, clear APK cache list
-				list_for_each_entry_safe(
-					pos, n, &apk_path_hash_list, list) {
+				list_for_each_entry_safe(pos, n, &apk_path_hash_list, list) {
 					list_del(&pos->list);
 					kfree(pos);
 				}
 			} else {
-				struct apk_path_hash *apk_data =
-					kmalloc(sizeof(struct apk_path_hash),
-						GFP_ATOMIC);
+				struct apk_path_hash *apk_data = kmalloc(sizeof(struct apk_path_hash), GFP_ATOMIC);
 				if (apk_data) {
 					apk_data->hash = hash;
 					apk_data->exists = true;
-					list_add_tail(&apk_data->list,
-						      &apk_path_hash_list);
+					list_add_tail(&apk_data->list, &apk_path_hash_list);
 				}
 			}
 		}
@@ -395,9 +350,8 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
 	int i, stop = 0;
 	struct list_head data_path_list;
 	INIT_LIST_HEAD(&data_path_list);
-	INIT_LIST_HEAD(&apk_path_hash_list);
 	unsigned long data_app_magic = 0;
-
+	
 	// Initialize APK cache list
 	struct apk_path_hash *pos, *n;
 	list_for_each_entry(pos, &apk_path_hash_list, list) {
@@ -414,46 +368,35 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
 		struct data_path *pos, *n;
 
 		list_for_each_entry_safe(pos, n, &data_path_list, list) {
-			struct my_dir_context ctx = {
-				.ctx.actor = my_actor,
-				.data_path_list = &data_path_list,
-				.parent_dir = pos->dirpath,
-				.private_data = uid_data,
-				.depth = pos->depth,
-				.stop = &stop
-			};
+			struct my_dir_context ctx = { .ctx.actor = my_actor,
+						      .data_path_list = &data_path_list,
+						      .parent_dir = pos->dirpath,
+						      .private_data = uid_data,
+						      .depth = pos->depth,
+						      .stop = &stop };
 			struct file *file;
 
 			if (!stop) {
-				file = ksu_filp_open_compat(
-					pos->dirpath, O_RDONLY | O_NOFOLLOW, 0);
+				file = ksu_filp_open_compat(pos->dirpath, O_RDONLY | O_NOFOLLOW, 0);
 				if (IS_ERR(file)) {
-					pr_err("Failed to open directory: %s, err: %ld\n",
-					       pos->dirpath, PTR_ERR(file));
+					pr_err("Failed to open directory: %s, err: %ld\n", pos->dirpath, PTR_ERR(file));
 					goto skip_iterate;
 				}
-
+				
 				// grab magic on first folder, which is /data/app
 				if (!data_app_magic) {
 					if (file->f_inode->i_sb->s_magic) {
-						data_app_magic =
-							file->f_inode->i_sb
-								->s_magic;
-						pr_info("%s: dir: %s got magic! 0x%lx\n",
-							__func__, pos->dirpath,
-							data_app_magic);
+						data_app_magic = file->f_inode->i_sb->s_magic;
+						pr_info("%s: dir: %s got magic! 0x%lx\n", __func__, pos->dirpath, data_app_magic);
 					} else {
 						filp_close(file, NULL);
 						goto skip_iterate;
 					}
 				}
-
-				if (file->f_inode->i_sb->s_magic !=
-				    data_app_magic) {
-					pr_info("%s: skip: %s magic: 0x%lx expected: 0x%lx\n",
-						__func__, pos->dirpath,
-						file->f_inode->i_sb->s_magic,
-						data_app_magic);
+				
+				if (file->f_inode->i_sb->s_magic != data_app_magic) {
+					pr_info("%s: skip: %s magic: 0x%lx expected: 0x%lx\n", __func__, pos->dirpath, 
+						file->f_inode->i_sb->s_magic, data_app_magic);
 					filp_close(file, NULL);
 					goto skip_iterate;
 				}
@@ -468,11 +411,12 @@ skip_iterate:
 		}
 	}
 
-	// clear apk_path_hash_list unconditionally
-	pr_info("search manager: cleanup!\n");
+	// Remove stale cached APK entries
 	list_for_each_entry_safe(pos, n, &apk_path_hash_list, list) {
-		list_del(&pos->list);
-		kfree(pos);
+		if (!pos->exists) {
+			list_del(&pos->list);
+			kfree(pos);
+		}
 	}
 }
 
@@ -482,7 +426,7 @@ static bool is_uid_exist(uid_t uid, char *package, void *data)
 	struct uid_data *np;
 
 	bool exist = false;
-	list_for_each_entry(np, list, list) {
+	list_for_each_entry (np, list, list) {
 		if (np->uid == uid % 100000 &&
 		    strncmp(np->package, package, KSU_MAX_PACKAGE_NAME) == 0) {
 			exist = true;
@@ -497,16 +441,22 @@ void track_throne(void)
 	struct list_head uid_list;
 	INIT_LIST_HEAD(&uid_list);
 
-	pr_info("Starting UID scan from user data directory\n");
-	int ret = scan_user_data_for_uids(&uid_list);
+	pr_info("track_throne triggered, attempting whitelist read\n");
+	
+	// Try read whitelist first
+	int ret = read_uid_whitelist(&uid_list);
 	
 	if (ret < 0) {
-		pr_warn("Failed to scan user data directory (%d), falling back to packages.list\n", ret);
+		pr_info("whitelist read failed (%d), request userspace scan\n", ret);
+		
+		// Request userspace to rescan
+		ksu_request_userspace_scan();
 		
 		// fallback to packages.list method
 		struct file *fp = ksu_filp_open_compat(SYSTEM_PACKAGES_LIST_PATH, O_RDONLY, 0);
 		if (IS_ERR(fp)) {
-			pr_err("Both user data scan and packages.list failed: %ld\n", PTR_ERR(fp));
+			pr_err("%s: open " SYSTEM_PACKAGES_LIST_PATH " failed: %ld\n",
+		       __func__, PTR_ERR(fp));
 			goto out;
 		}
 
@@ -561,7 +511,7 @@ void track_throne(void)
 		filp_close(fp, 0);
 		pr_info("Loaded %zu packages from packages.list fallback\n", fallback_count);
 	} else {
-		pr_info("UserDE UID: Successfully loaded %zu packages from user data directory\n", list_count_nodes(&uid_list));
+		pr_info("loaded uids from whitelist successfully\n");
 	}
 
 	// now update uid list
@@ -571,8 +521,8 @@ void track_throne(void)
 	// first, check if manager_uid exist!
 	bool manager_exist = false;
 	bool dynamic_manager_exist = false;
-
-	list_for_each_entry(np, &uid_list, list) {
+	
+	list_for_each_entry (np, &uid_list, list) {
 		// if manager is installed in work profile, the uid in packages.list is still equals main profile
 		// don't delete it in this case!
 		int manager_uid = ksu_get_manager_uid() % 100000;
@@ -581,13 +531,12 @@ void track_throne(void)
 			break;
 		}
 	}
-
+	
 	// Check for dynamic managers
 	if (!dynamic_manager_exist && ksu_is_dynamic_manager_enabled()) {
-		list_for_each_entry(np, &uid_list, list) {
+		list_for_each_entry (np, &uid_list, list) {
 			// Check if this uid is a dynamic manager (not the traditional manager)
-			if (ksu_is_any_manager(np->uid) &&
-				 np->uid != ksu_get_manager_uid()) {
+			if (ksu_is_any_manager(np->uid) && np->uid != ksu_get_manager_uid()) {
 				dynamic_manager_exist = true;
 				break;
 			}
@@ -609,13 +558,13 @@ void track_throne(void)
 		search_manager("/data/app", 2, &uid_list);
 		pr_info("Search Dynamic sign manager finished\n");
 	}
-
+	
 prune:
 	// then prune the allowlist
 	ksu_prune_allowlist(is_uid_exist, &uid_list);
 out:
 	// free uid_list
-	list_for_each_entry_safe(np, n, &uid_list, list) {
+	list_for_each_entry_safe (np, n, &uid_list, list) {
 		list_del(&np->list);
 		kfree(np);
 	}
